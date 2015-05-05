@@ -52,7 +52,9 @@ local params = {batch_size=20,
                 vocab_size=10000,
                 max_epoch=4,
                 max_max_epoch=13,
-                max_grad_norm=5}
+                max_grad_norm=5,
+                lstm_impl='zaremba'
+              }
 
 local function transfer_data(x)
   return x:cuda()
@@ -80,7 +82,39 @@ local function lstm(i, prev_c, prev_h)
   return next_c, next_h
 end
 
+local function jcj_lstm(i, prev_c, prev_h)
+  local rnn_size = params.rnn_size
+  local i2h = nn.Linear(rnn_size, 4 * rnn_size)(i)
+  local h2h = nn.Linear(rnn_size, 4 * rnn_size)(prev_h)
+  local input_sums = nn.CAddTable()({i2h, h2h})
+
+  local sigmoid_chunk = nn.Narrow(2, 1, 3 * rnn_size)(input_sums)
+  sigmoid_chunk = nn.Sigmoid()(sigmoid_chunk)
+
+  local in_gate = nn.Narrow(2, 1, rnn_size)(sigmoid_chunk)
+  local forget_gate = nn.Narrow(2, rnn_size + 1, rnn_size)(sigmoid_chunk)
+  local out_gate = nn.Narrow(2, 2 * rnn_size + 1, rnn_size)(sigmoid_chunk)
+  local in_transform = nn.Narrow(2, 3 * rnn_size + 1, rnn_size)(nn.Tanh()(input_sums))
+
+  local next_c = nn.CAddTable()({
+    nn.CMulTable()({forget_gate, prev_c}),
+    nn.CMulTable()({in_gate, in_transform})
+  })
+  local next_h = nn.CMulTable()({out_gate, nn.Tanh()(next_c)})
+  return next_c, next_h
+end
+
 local function create_network()
+
+  local lstm_fn = nil
+  if params.lstm_impl == 'zaremba' then
+    lstm_fn = lstm
+  elseif params.lstm_impl == 'jcj' then
+    lstm_fn = jcj_lstm
+  else
+    assert(false, 'Unrecognized LSTM implementation')
+  end
+
   local x                = nn.Identity()()
   local y                = nn.Identity()()
   local prev_s           = nn.Identity()()
@@ -92,7 +126,7 @@ local function create_network()
     local prev_c         = split[2 * layer_idx - 1]
     local prev_h         = split[2 * layer_idx]
     local dropped        = nn.Dropout(params.dropout)(i[layer_idx - 1])
-    local next_c, next_h = lstm(dropped, prev_c, prev_h)
+    local next_c, next_h = lstm_fn(dropped, prev_c, prev_h)
     table.insert(next_s, next_c)
     table.insert(next_s, next_h)
     i[layer_idx] = next_h
@@ -247,11 +281,14 @@ local function main()
     if step % torch.round(epoch_size / 10) == 10 then
       local wps = torch.floor(total_cases / torch.toc(start_time))
       local since_beginning = g_d(torch.toc(beginning_time) / 60)
+      local mean_iteration = torch.toc(beginning_time) / step
+      mean_iteration = string.format('%.4f', mean_iteration)
       print('epoch = ' .. g_f3(epoch) ..
             ', train perp. = ' .. g_f3(torch.exp(perps:mean())) ..
             ', wps = ' .. wps ..
             ', dw:norm() = ' .. g_f3(model.norm_dw) ..
             ', lr = ' ..  g_f3(params.lr) ..
+            ', mean iteration time = ' .. mean_iteration .. 'secs. ' ..
             ', since beginning = ' .. since_beginning .. ' mins.')
     end
     if step % epoch_size == 0 then
